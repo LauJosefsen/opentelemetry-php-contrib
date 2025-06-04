@@ -59,9 +59,8 @@ class Command implements LaravelHook
             IlluminateCommand::class,
             'execute',
             pre: function (IlluminateCommand $command, array $params, string $class, string $function, ?string $filename, ?int $lineno) {
-                // If the command has the LongRunning attribute, we don't want to trace it.
                 if (!$this->shouldSpanCommand($command)) {
-                    return $params; // Skip tracing for long-running commands.
+                    return $params;
                 }
 
                 /** @psalm-suppress ArgumentTypeCoercion */
