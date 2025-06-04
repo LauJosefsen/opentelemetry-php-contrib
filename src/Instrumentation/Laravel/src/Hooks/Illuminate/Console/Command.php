@@ -24,6 +24,34 @@ class Command implements LaravelHook
         $this->hookExecute();
     }
 
+    const LONG_RUNNING_COMMANDS = [
+        'queue:work',
+        'queue:listen',
+        'schedule:work',
+        'octane:start',
+    ];
+
+    protected function shouldSpanCommand(IlluminateCommand $command): bool
+    {
+        if (($name = $command->getName()) !== null) {
+            if (in_array($name, self::LONG_RUNNING_COMMANDS, true)) {
+                return false; // Skip tracing for known long-running commands.
+            }
+        }
+
+        // Check if the command has the LongRunning attribute.
+        if ((new \ReflectionClass($command))->getAttributes(LongRunning::class)) {
+            return false; // Skip tracing for long-running commands.
+        }
+
+        // Lastly if the command has a function isLongRunning and it returns true, skip tracing. This allows packages that support PHP 7 to avoid using PHP 8 attributes
+        if (method_exists($command, 'isLongRunning') && $command->isLongRunning()) {
+            return false; // Skip tracing for long-running commands.
+        }
+
+        return true;
+    }
+
     /** @psalm-suppress PossiblyUnusedReturnValue  */
     protected function hookExecute(): bool
     {
@@ -31,6 +59,11 @@ class Command implements LaravelHook
             IlluminateCommand::class,
             'execute',
             pre: function (IlluminateCommand $command, array $params, string $class, string $function, ?string $filename, ?int $lineno) {
+                // If the command has the LongRunning attribute, we don't want to trace it.
+                if (!$this->shouldSpanCommand($command)) {
+                    return $params; // Skip tracing for long-running commands.
+                }
+
                 /** @psalm-suppress ArgumentTypeCoercion */
                 $builder = $this->instrumentation
                     ->tracer()
