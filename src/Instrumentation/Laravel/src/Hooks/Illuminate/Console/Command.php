@@ -40,7 +40,7 @@ class Command implements LaravelHook
         }
 
         // Check if the command has the LongRunning attribute.
-        if ((new \ReflectionClass($command))->getAttributes(LongRunning::class)) {
+        if ((new \ReflectionClass($command))->getAttributes(LongRunningCommand::class)) {
             return false; // Skip tracing for long-running commands.
         }
 
