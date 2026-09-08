@@ -6,8 +6,14 @@ namespace OpenTelemetry\Tests\Contrib\Instrumentation\Laravel\Unit\Watchers;
 
 use ArrayObject;
 use Exception;
+use Illuminate\Config\Repository;
+use Illuminate\Events\Dispatcher;
+use Illuminate\Foundation\Application;
 use Illuminate\Log\Events\MessageLogged;
+use Illuminate\Log\Logger;
 use Illuminate\Log\LogManager;
+use Monolog\Handler\TestHandler;
+use Monolog\Logger as Monolog;
 use OpenTelemetry\API\Instrumentation\CachedInstrumentation;
 use OpenTelemetry\API\Instrumentation\Configurator;
 use OpenTelemetry\Context\ScopeInterface;
@@ -19,8 +25,9 @@ use OpenTelemetry\SDK\Logs\LoggerProvider;
 use OpenTelemetry\SDK\Logs\Processor\SimpleLogRecordProcessor;
 use OpenTelemetry\SemConv\Attributes\ExceptionAttributes;
 use PHPUnit\Framework\TestCase;
+use Psr\Log\NullLogger;
 use ReflectionProperty;
-use stdClass;
+use RuntimeException;
 use Stringable;
 
 class LogWatcherTest extends TestCase
@@ -51,21 +58,20 @@ class LogWatcherTest extends TestCase
         putenv(LogWatcher::OTEL_PHP_LARAVEL_LOG_ATTRIBUTES_FLATTEN);
     }
 
-    private function createWatcher(): LogWatcher
+    private function createWatcher(?LogManager $logManager = null): LogWatcher
     {
         $watcher = new LogWatcher(new CachedInstrumentation('io.opentelemetry.contrib.php.laravel'));
 
-        // Inject a mock LogManager that passes all log levels through.
-        // getLogger() is forwarded via __call on the real class, so addMethods() is required.
-        $mockLogManager = $this->getMockBuilder(LogManager::class)
-            ->disableOriginalConstructor()
-            ->addMethods(['getLogger'])
-            ->getMock();
-        $mockLogManager->method('getLogger')->willReturn(new stdClass());
+        if ($logManager === null) {
+            $logManager = $this->createMock(LogManager::class);
+            $logManager->method('getChannels')->willReturn([]);
+            $logManager->method('getDefaultDriver')->willReturn('test');
+            $logManager->expects($this->never())->method('__call');
+        }
 
         $prop = new ReflectionProperty(LogWatcher::class, 'logger');
         $prop->setAccessible(true);
-        $prop->setValue($watcher, $mockLogManager);
+        $prop->setValue($watcher, $logManager);
 
         return $watcher;
     }
@@ -73,6 +79,72 @@ class LogWatcherTest extends TestCase
     private function emit(LogWatcher $watcher, string $message, array $context = [], string $level = 'info'): void
     {
         $watcher->recordLog(new MessageLogged($level, $message, $context));
+    }
+
+    public function test_filters_logs_using_an_already_resolved_channel(): void
+    {
+        if (Monolog::API < 3) {
+            $this->markTestSkipped('String log levels are only supported by Monolog 3.');
+        }
+
+        $logManager = $this->createMock(LogManager::class);
+        $logManager->method('getDefaultDriver')->willReturn('test');
+        $logManager->method('getChannels')->willReturn([
+            'test' => new Logger(new Monolog('test', [new TestHandler('warning')])),
+        ]);
+        $logManager->expects($this->never())->method('__call');
+        $watcher = $this->createWatcher($logManager);
+
+        $this->emit($watcher, 'Filtered message');
+        $this->emit($watcher, 'Exported message', [], 'error');
+
+        $this->assertCount(1, $this->storage);
+        $this->assertSame('Exported message', $this->storage[0]->getBody());
+    }
+
+    public function test_failed_logger_uses_emergency_logging_and_can_recover(): void
+    {
+        $config = new Repository([
+            'logging' => [
+                'default' => 'test',
+                'channels' => [
+                    'test' => [
+                        'driver' => 'custom',
+                        'via' => static function (): void {
+                            throw new RuntimeException('Logger factory failed');
+                        },
+                    ],
+                    'emergency' => ['path' => 'php://memory'],
+                ],
+            ],
+        ]);
+        $events = new Dispatcher();
+        $app = $this->createMock(Application::class);
+        $app->method('offsetGet')->willReturnMap([
+            ['config', $config],
+            ['events', $events],
+        ]);
+        $logManager = new LogManager($app);
+        $watcher = $this->createWatcher($logManager);
+        $eventCount = 0;
+        $events->listen(MessageLogged::class, function () use (&$eventCount): void {
+            $this->assertLessThanOrEqual(3, ++$eventCount, 'Log events must not recurse');
+        });
+        $events->listen(MessageLogged::class, [$watcher, 'recordLog']);
+
+        $logManager->error('Original message');
+
+        $this->assertCount(2, $this->storage);
+        $this->assertSame('Unable to create configured logger. Using emergency logger.', $this->storage[0]->getBody());
+        $this->assertSame('Logger factory failed', $this->storage[0]->getAttributes()->get(ExceptionAttributes::EXCEPTION_MESSAGE));
+        $this->assertSame('Original message', $this->storage[1]->getBody());
+
+        $config->set('logging.channels.test.via', static fn () => new NullLogger());
+        $logManager->error('After repair');
+
+        $this->assertCount(3, $this->storage);
+        $this->assertSame('After repair', $this->storage[2]->getBody());
+        $this->assertArrayHasKey('test', $logManager->getChannels());
     }
 
     public function test_default_stores_context_as_structured_array(): void

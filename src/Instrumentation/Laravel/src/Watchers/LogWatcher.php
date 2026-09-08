@@ -47,7 +47,8 @@ class LogWatcher extends Watcher
      */
     public function recordLog(MessageLogged $log): void
     {
-        $underlyingLogger = $this->logger->getLogger();
+        $channel = $this->logger->getChannels()[$this->logger->getDefaultDriver()] ?? null;
+        $underlyingLogger = $channel?->getLogger();
 
         /**
          * This assumes that the underlying logger (expected to be monolog) would accept `$log->level` as a string.
@@ -55,7 +56,7 @@ class LogWatcher extends Watcher
          */
         try {
             /** @phan-suppress-next-line PhanUndeclaredMethod */
-            if (method_exists($underlyingLogger, 'isHandling') && !$underlyingLogger->isHandling($log->level)) {
+            if ($underlyingLogger !== null && method_exists($underlyingLogger, 'isHandling') && !$underlyingLogger->isHandling($log->level)) {
                 return;
             }
         } catch (TypeError) {
